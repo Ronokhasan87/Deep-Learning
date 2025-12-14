@@ -1,0 +1,815 @@
+# -*- coding: utf-8 -*-
+"""FPS Enhanced GA_ver.4 with Parallel Computing.ipynb
+
+Enhanced version with parallel computing for multiple counterfactual explanations
+"""
+
+# ------------------------- Data Loading & Preprocessing -------------------------
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.model_selection import KFold
+from sklearn.metrics import pairwise_distances
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from sklearn.cluster import KMeans
+import os, time
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set random seeds for reproducibility
+np.random.seed(42)
+torch.manual_seed(42)
+
+# Load data
+def preprocess_data():
+    data = pd.read_csv("/content/german_credit_data (1).csv")
+
+    # Define feature indices (adjust based on your dataset)
+    cont_indices = [0, 15, 16]  # continuous features
+    cat_indices = [i for i in range(data.shape[1]-1) if i not in cont_indices]
+
+    X = data.iloc[:, :-1]
+    y = data.iloc[:, -1].values
+
+    # Process continuous features
+    X_cont = X.iloc[:, cont_indices].values
+    scaler = StandardScaler()
+    X_cont_scaled = scaler.fit_transform(X_cont)
+    X_cont_scaled = (X_cont_scaled - X_cont_scaled.min(axis=0)) / (X_cont_scaled.max(axis=0) - X_cont_scaled.min(axis=0) + 1e-8)
+
+    # Process categorical features with one-hot encoding
+    X_cat = X.iloc[:, cat_indices].values
+    encoder = OneHotEncoder(sparse_output=False, drop='first')
+    X_cat_encoded = encoder.fit_transform(X_cat)
+
+    # Combine features
+    X_processed = np.hstack([X_cont_scaled, X_cat_encoded])
+
+    # Calculate MAD for continuous features
+    MAD = np.array([np.median(np.abs(X_cont_scaled[:, j] - np.median(X_cont_scaled[:, j])))
+                    for j in range(X_cont_scaled.shape[1])])
+
+    return X_processed, y, cont_indices, cat_indices, MAD, scaler, encoder
+
+X_processed, y, cont_indices, cat_indices, MAD, scaler, encoder = preprocess_data()
+print(f"Data shape: {X_processed.shape}, Continuous: {len(cont_indices)}, Categorical: {X_processed.shape[1] - len(cont_indices)}")
+
+# --------------------- Single Neural Net ---------------------
+class SingleLayerCreditModel(nn.Module):
+    def __init__(self, input_dim):
+        super(SingleLayerCreditModel, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.network(x)
+
+# --------------------- Training Function ---------------------
+def train_model(X_train, y_train, input_dim, epochs=100, lr=0.01):
+    model = SingleLayerCreditModel(input_dim)
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+    y_train_tensor = torch.tensor(y_train.reshape(-1, 1), dtype=torch.float32)
+
+    loss_history = []
+    for _ in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        output = model(X_train_tensor)
+        loss = criterion(output, y_train_tensor)
+        loss.backward()
+        optimizer.step()
+        loss_history.append(loss.item())
+
+    model.eval()
+    return model, loss_history
+
+# --------------------- 5-Fold Cross Validation with Accuracy ---------------------
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+accuracies = []
+all_loss_histories = []
+
+for fold, (train_idx, test_idx) in enumerate(kf.split(X_processed)):
+    X_train, y_train = X_processed[train_idx], y[train_idx]
+    X_test, y_test = X_processed[test_idx], y[test_idx]
+
+    model, loss_history = train_model(X_train, y_train, input_dim=X_processed.shape[1])
+    all_loss_histories.append(loss_history)
+
+    # Accuracy
+    X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+    y_test_tensor = torch.tensor(y_test.reshape(-1, 1), dtype=torch.float32)
+    with torch.no_grad():
+        y_pred_probs = model(X_test_tensor)
+        y_pred_labels = (y_pred_probs > 0.5).float()
+        acc = (y_pred_labels == y_test_tensor).float().mean().item()
+        accuracies.append(acc)
+        print(f"Fold {fold+1} Accuracy: {acc:.4f}")
+
+# Final Report
+print(f"\nAverage Accuracy over 5 folds: {np.mean(accuracies):.4f}")
+
+# Plot Loss
+plt.figure(figsize=(10, 6))
+for i, loss in enumerate(all_loss_histories):
+    plt.plot(loss, label=f"Fold {i+1}")
+plt.title("Training Loss per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Final trained model to use downstream
+final_model, _ = train_model(X_processed, y, X_processed.shape[1])
+
+# === Helper Functions ===
+def sbx_crossover(P, eta=15):
+    N, D = P.shape
+    C = np.copy(P)
+    for i in range(0, N, 2):
+        if i+1 >= N: break
+        for j in range(D):
+            if np.random.rand() < 0.5:
+                beta = np.random.rand()
+                beta_q = (2*beta)**(1/(eta+1)) if beta <= 0.5 else (1/(2*(1-beta)))**(1/(eta+1))
+                C[i, j] = 0.5*((1+beta_q)*P[i,j] + (1-beta_q)*P[i+1,j])
+                C[i+1, j] = 0.5*((1-beta_q)*P[i,j] + (1+beta_q)*P[i+1,j])
+    return np.clip(C, 0, 1)
+
+def polynomial_mutation(P, eta=20, p_mut=0.1):
+    N, D = P.shape
+    for i in range(N):
+        for j in range(D):
+            if np.random.rand() < p_mut:
+                r = np.random.rand()
+                delta = (2*r)**(1/(eta+1)) - 1 if r < 0.5 else 1 - (2*(1-r))**(1/(eta+1))
+                P[i, j] += delta
+    return np.clip(P, 0, 1)
+
+def farthest_point_sampling(P, N):
+    if len(P) == 0 or N <= 0:
+        return np.array([])
+    if N >= len(P): 
+        return np.arange(len(P))
+    selected = [np.random.randint(len(P))]
+    dists = pairwise_distances(P, P[selected]).flatten()
+    for _ in range(1, N):
+        idx = np.argmax(dists)
+        selected.append(idx)
+        dists = np.minimum(dists, pairwise_distances(P, P[[idx]]).flatten())
+    return np.array(selected)
+
+def is_pareto_efficient(costs):
+    if len(costs) == 0:
+        return np.array([], dtype=bool)
+    is_efficient = np.ones(costs.shape[0], dtype=bool)
+    for i, c in enumerate(costs):
+        if is_efficient[i]:
+            is_efficient[is_efficient] = np.any(costs[is_efficient] < c, axis=1) | np.all(costs[is_efficient] == c, axis=1)
+            is_efficient[i] = True
+    return is_efficient
+
+# === Optimization Metrics ===
+def calculate_hypervolume(pareto_front, ref_point=None):
+    if len(pareto_front) == 0:
+        return 0
+    if ref_point is None:
+        ref_point = np.max(pareto_front, axis=0) + 1
+    volume = 0
+    for point in pareto_front:
+        volume += np.prod(ref_point - point)
+    return volume
+
+def calculate_gd(pareto_front):
+    if len(pareto_front) == 0:
+        return float('inf')
+    ideal = np.min(pareto_front, axis=0)
+    distances = np.sqrt(np.sum((pareto_front - ideal)**2, axis=1))
+    return np.mean(distances)
+
+def calculate_delta_p(pareto_front):
+    if len(pareto_front) < 2:
+        return 0
+    from scipy.spatial.distance import pdist
+    distances = pdist(pareto_front)
+    mean_dist = np.mean(distances)
+    std_dist = np.std(distances)
+    return std_dist / (mean_dist + 1e-8)
+
+# === Problem Class ===
+class GermanCredit_CFEGenerator:
+    def __init__(self, original_x, target_y, mad, cont_len, model):
+        self.OriginalX = original_x
+        self.TargetY = target_y
+        self.MAD = mad
+        self.cont_len = cont_len  # number of continuous features
+        self.D = len(original_x)
+        self.M = 3
+        self.model = model
+        self.lower = np.zeros(self.D)
+        self.upper = np.ones(self.D)
+
+    def Initialization(self, N):
+        return np.random.rand(N, self.D)
+
+    def CalObj(self, PopDec):
+        z = 2 * self.TargetY - 1
+        obj1, obj2, obj3 = [], [], []
+
+        for x in PopDec:
+            # Objective 1: Classification loss
+            logit = self.model(torch.tensor(x.reshape(1, -1), dtype=torch.float32)).item()
+            DiffY = max(0, 1 - z * logit)
+
+            # Objective 2: Distance (proximity)
+            if self.cont_len > 0:
+                dist_cont = np.sum(np.abs(x[:self.cont_len] - self.OriginalX[:self.cont_len]) / (self.MAD + 1e-8))
+            else:
+                dist_cont = 0
+            dist_cat = np.sum(x[self.cont_len:] != self.OriginalX[self.cont_len:])
+            DiffX = (dist_cont + dist_cat) / self.D
+
+            # Objective 3: Sparsity (L1 norm)
+            DiffZ = np.sum(np.abs(x - self.OriginalX))
+
+            obj1.append(DiffY)
+            obj2.append(DiffX)
+            obj3.append(DiffZ)
+
+        return np.vstack([obj1, obj2, obj3]).T
+
+# === Algorithm Class ===
+class FPS_Enhanced_GA:
+    def __init__(self):
+        self.hv_history = []
+        self.gd_history = []
+        self.delta_p_history = []
+
+    def calculate_convergence(self, obj_vals):
+        """Convergence value (Eq. 8)"""
+        if np.sum(obj_vals**2) == 0:
+            return float('inf')
+        return 1 / np.sum(obj_vals**2)
+
+    def calculate_cosine_similarity(self, x, y):
+        """Cosine similarity (Eq. 9)"""
+        dot_product = np.dot(x, y)
+        norm_x = np.linalg.norm(x)
+        norm_y = np.linalg.norm(y)
+        if norm_x == 0 or norm_y == 0:
+            return 0
+        return dot_product / (norm_x * norm_y)
+
+    def calculate_delta_threshold(self, x, y, population):
+        """Delta threshold (Eq. 11)"""
+        d_manhattan = np.sum(np.abs(x - y))
+        distances = []
+        for i in range(len(population)):
+            for j in range(i+1, len(population)):
+                distances.append(np.sum(np.abs(population[i] - population[j])))
+
+        if len(distances) == 0:
+            return 0.5
+
+        min_dist = min(distances)
+        max_dist = max(distances)
+
+        if max_dist == min_dist:
+            return 0.5
+
+        return (d_manhattan - min_dist) / (max_dist - min_dist)
+
+    def building_mating_pool(self, P, CSA, N):
+        """Algorithm 3: Building the Mating Pool"""
+        P_prime = []
+        combined_pop = np.vstack([P, CSA]) if len(CSA) > 0 else P
+
+        for _ in range(2 * N):
+            # Randomly select solution x
+            x_idx = np.random.randint(len(combined_pop))
+            x = combined_pop[x_idx]
+
+            # Find solution y with minimum cosine similarity
+            min_cos_sim = float('inf')
+            y_idx = 0
+            for i, candidate in enumerate(P):
+                cos_sim = self.calculate_cosine_similarity(x, candidate)
+                if cos_sim < min_cos_sim:
+                    min_cos_sim = cos_sim
+                    y_idx = i
+
+            y = P[y_idx]
+
+            # Calculate convergence values
+            x_obj = self.problem.CalObj(x.reshape(1, -1))[0]
+            y_obj = self.problem.CalObj(y.reshape(1, -1))[0]
+
+            con_x = self.calculate_convergence(x_obj)
+            con_y = self.calculate_convergence(y_obj)
+
+            # Calculate delta threshold
+            delta = self.calculate_delta_threshold(x, y, combined_pop)
+
+            # Selection logic
+            if np.random.rand() < delta and con_y > con_x:
+                P_prime.append(y)
+            else:
+                P_prime.append(x)
+
+        return np.array(P_prime)
+
+    def environmental_selection(self, P, C):
+        """Algorithm 4: Environmental Selection"""
+        combined = np.vstack([P, C])
+        combined_objs = self.problem.CalObj(combined)
+
+        # Non-dominated sorting
+        pareto_mask = is_pareto_efficient(combined_objs)
+        pareto_set = combined[pareto_mask]
+
+        # FPS selection if needed
+        if len(pareto_set) > len(P):
+            selected_indices = farthest_point_sampling(pareto_set, len(P))
+            return pareto_set[selected_indices]
+        else:
+            return pareto_set
+
+    def Solve(self, Problem, N=100, generations=20):
+        self.problem = Problem
+
+        # Initialize
+        CA = Problem.Initialization(N)
+        CSA = CA.copy()
+
+        # Initialize metrics tracking
+        self.hv_history = []
+        self.gd_history = []
+        self.delta_p_history = []
+
+        for gen in range(generations):
+            # Building mating pool
+            Parent = self.building_mating_pool(CA, CSA, N)
+
+            # Variation
+            Off = polynomial_mutation(sbx_crossover(Parent))
+
+            # Update CSA (simple version)
+            combined_csa = np.vstack([CSA, Off])
+            combined_csa_objs = Problem.CalObj(combined_csa)
+            csa_pareto_mask = is_pareto_efficient(combined_csa_objs)
+            CSA = combined_csa[csa_pareto_mask]
+            if len(CSA) > 50:  # limit size
+                selected_indices = farthest_point_sampling(CSA, 50)
+                CSA = CSA[selected_indices]
+
+            # Environmental selection
+            CA = self.environmental_selection(CA, Off)
+
+            # Calculate metrics
+            CA_objs = Problem.CalObj(CA)
+            hv = calculate_hypervolume(CA_objs)
+            gd = calculate_gd(CA_objs)
+            delta_p = calculate_delta_p(CA_objs)
+
+            self.hv_history.append(hv)
+            self.gd_history.append(gd)
+            self.delta_p_history.append(delta_p)
+
+        return CA, Problem.CalObj(CA)
+
+# === Parallel Processing Functions ===
+def process_single_sample(args):
+    """Process a single sample to generate CFEs (for parallel execution)"""
+    idx, sample_idx, X_sample, y_sample, MAD, cont_len, model = args
+    
+    print(f"Processing sample {sample_idx} on process {idx}")
+    start_time = time.time()
+    
+    OriginalX = X_sample
+    TargetY = 1 - y_sample  # Flip class for counterfactual
+    
+    Problem = GermanCredit_CFEGenerator(OriginalX, TargetY, MAD, cont_len, model)
+    Algorithm = FPS_Enhanced_GA()
+    
+    CA, CA_objs = Algorithm.Solve(Problem, N=50, generations=15)
+    
+    # Select final CFEs using K-means clustering
+    def select_final_cfes(CA, k=10):
+        if len(CA) <= k:
+            return CA
+        kmeans = KMeans(n_clusters=k, random_state=0).fit(CA)
+        final = []
+        for i in range(k):
+            idxs = np.where(kmeans.labels_ == i)[0]
+            if len(idxs) > 0:
+                final.append(CA[np.random.choice(idxs)])
+        return np.array(final)
+    
+    CFEs = select_final_cfes(CA, k=10)
+    
+    runtime = time.time() - start_time
+    
+    # Evaluate CFEs
+    def evaluate_cfes_detailed(CFEs, OriginalX, TargetY, model, cont_len):
+        preds = model(torch.tensor(CFEs, dtype=torch.float32)).detach().numpy().flatten()
+        
+        # Feasibility (Validity)
+        if TargetY == 1:
+            feasibility = np.mean(preds > 0.5)
+        else:
+            feasibility = np.mean(preds < 0.5)
+        
+        # Continuous Proximity (negative for smaller = better)
+        if cont_len > 0:
+            CFEs_cont = CFEs[:, :cont_len]
+            OriginalX_cont = OriginalX[:cont_len]
+            cont_distances = np.abs(CFEs_cont - OriginalX_cont) / (MAD + 1e-8)
+            continuous_proximity = -np.mean(np.sum(cont_distances, axis=1))
+            
+            # Continuous Diversity
+            if len(CFEs_cont) > 1:
+                cont_pairwise = pairwise_distances(CFEs_cont)
+                continuous_diversity = np.mean(cont_pairwise[np.triu_indices_from(cont_pairwise, k=1)])
+            else:
+                continuous_diversity = 0
+        else:
+            continuous_proximity = 0
+            continuous_diversity = 0
+        
+        # Categorical Proximity
+        cat_len = len(OriginalX) - cont_len
+        if cat_len > 0:
+            CFEs_cat = CFEs[:, cont_len:]
+            OriginalX_cat = OriginalX[cont_len:]
+            cat_distances = np.sum(CFEs_cat != OriginalX_cat, axis=1)
+            categorical_proximity = 1 - np.mean(cat_distances) / cat_len
+            
+            # Categorical Diversity
+            if len(CFEs_cat) > 1:
+                cat_pairwise = pairwise_distances(CFEs_cat, metric='hamming')
+                categorical_diversity = np.mean(cat_pairwise[np.triu_indices_from(cat_pairwise, k=1)])
+            else:
+                categorical_diversity = 0
+        else:
+            categorical_proximity = 1
+            categorical_diversity = 0
+        
+        return feasibility, continuous_proximity, categorical_proximity, continuous_diversity, categorical_diversity
+    
+    feasibility, cont_prox, cat_prox, cont_div, cat_div = evaluate_cfes_detailed(
+        CFEs, OriginalX, TargetY, model, cont_len
+    )
+    
+    result = {
+        'sample_id': sample_idx,
+        'feasibility': feasibility,
+        'continuous_proximity': cont_prox,
+        'categorical_proximity': cat_prox,
+        'continuous_diversity': cont_div,
+        'categorical_diversity': cat_div,
+        'runtime': runtime,
+        'CFEs': CFEs,
+        'CA': CA,
+        'CA_objs': CA_objs,
+        'hv_history': Algorithm.hv_history,
+        'gd_history': Algorithm.gd_history,
+        'delta_p_history': Algorithm.delta_p_history
+    }
+    
+    print(f"Completed sample {sample_idx} in {runtime:.2f}s")
+    return result
+
+def run_parallel_generator(X_data, y_data, max_rows=10, save_folder='Enhanced_Results_Parallel', n_workers=None):
+    """Run parallel counterfactual generation for multiple samples"""
+    os.makedirs(save_folder, exist_ok=True)
+    
+    if n_workers is None:
+        n_workers = min(mp.cpu_count(), max_rows)
+    
+    print(f"Starting parallel processing with {n_workers} workers for {max_rows} samples")
+    print(f"Using device: {'GPU' if torch.cuda.is_available() else 'CPU'}")
+    
+    # Prepare arguments for each sample
+    sample_indices = list(range(min(max_rows, len(X_data))))
+    args_list = []
+    
+    for i, sample_idx in enumerate(sample_indices):
+        args = (i % n_workers, sample_idx, X_data[sample_idx], y_data[sample_idx], 
+                MAD, len(cont_indices), final_model)
+        args_list.append(args)
+    
+    # Parallel processing using ProcessPoolExecutor
+    all_results = []
+    start_time = time.time()
+    
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        # Submit all tasks
+        future_to_sample = {executor.submit(process_single_sample, args): args[1] for args in args_list}
+        
+        # Process results as they complete
+        for future in tqdm(as_completed(future_to_sample), total=len(args_list), desc="Processing samples"):
+            sample_idx = future_to_sample[future]
+            try:
+                result = future.result()
+                all_results.append(result)
+                
+                # Save individual result
+                np.savez(f"{save_folder}/result_{sample_idx+1:03d}.npz",
+                        CFEs=result['CFEs'], 
+                        CA=result['CA'], 
+                        CA_objs=result['CA_objs'],
+                        hv_history=result['hv_history'],
+                        gd_history=result['gd_history'],
+                        delta_p_history=result['delta_p_history'],
+                        runtime=result['runtime'])
+                
+            except Exception as e:
+                print(f"Error processing sample {sample_idx}: {e}")
+    
+    total_runtime = time.time() - start_time
+    
+    # Aggregate results
+    results_summary = []
+    for result in all_results:
+        summary = {
+            'sample_id': result['sample_id'],
+            'feasibility': result['feasibility'],
+            'continuous_proximity': result['continuous_proximity'],
+            'categorical_proximity': result['categorical_proximity'],
+            'continuous_diversity': result['continuous_diversity'],
+            'categorical_diversity': result['categorical_diversity'],
+            'runtime': result['runtime']
+        }
+        results_summary.append(summary)
+        
+        print(f"Sample {result['sample_id']}: "
+              f"Feasibility: {result['feasibility']:.3f}, "
+              f"Cont_Prox: {result['continuous_proximity']:.3f}, "
+              f"Cat_Prox: {result['categorical_proximity']:.3f}, "
+              f"Runtime: {result['runtime']:.2f}s")
+    
+    # Calculate statistics
+    runtimes = [r['runtime'] for r in results_summary]
+    feasibilities = [r['feasibility'] for r in results_summary]
+    
+    print(f"\n{'='*60}")
+    print(f"PARALLEL PROCESSING COMPLETED")
+    print(f"{'='*60}")
+    print(f"Total samples processed: {len(results_summary)}")
+    print(f"Total runtime: {total_runtime:.2f}s")
+    print(f"Average runtime per sample: {np.mean(runtimes):.2f}s")
+    print(f"Total parallel speedup: {sum(runtimes) / total_runtime:.2f}x")
+    print(f"Average feasibility: {np.mean(feasibilities):.3f}")
+    print(f"Maximum runtime: {max(runtimes):.2f}s")
+    print(f"Minimum runtime: {min(runtimes):.2f}s")
+    print(f"{'='*60}")
+    
+    # Save aggregated results
+    df_summary = pd.DataFrame(results_summary)
+    df_summary.to_csv(f"{save_folder}/summary_results.csv", index=False)
+    
+    # Plot comparison of runtimes
+    plt.figure(figsize=(10, 6))
+    plt.bar(range(len(runtimes)), runtimes)
+    plt.xlabel('Sample Index')
+    plt.ylabel('Runtime (seconds)')
+    plt.title(f'Runtime per Sample (Parallel Processing, {n_workers} workers)')
+    plt.axhline(y=np.mean(runtimes), color='r', linestyle='--', label=f'Average: {np.mean(runtimes):.2f}s')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig(f"{save_folder}/runtime_comparison.png")
+    plt.show()
+    
+    # Plot feasibility distribution
+    plt.figure(figsize=(10, 6))
+    plt.bar(range(len(feasibilities)), feasibilities)
+    plt.xlabel('Sample Index')
+    plt.ylabel('Feasibility')
+    plt.title('Feasibility per Sample')
+    plt.axhline(y=np.mean(feasibilities), color='r', linestyle='--', 
+                label=f'Average: {np.mean(feasibilities):.3f}')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig(f"{save_folder}/feasibility_distribution.png")
+    plt.show()
+    
+    # Plot metrics for first 3 samples
+    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+    axes = axes.flatten()
+    
+    for i in range(min(3, len(all_results))):
+        result = all_results[i]
+        
+        # HV Performance
+        axes[i*3].plot(result['hv_history'])
+        axes[i*3].set_title(f'Sample {result["sample_id"]} - HV Performance')
+        axes[i*3].set_xlabel('Generation')
+        axes[i*3].set_ylabel('Hypervolume')
+        axes[i*3].grid(True)
+        
+        # GD Performance
+        axes[i*3+1].plot(result['gd_history'])
+        axes[i*3+1].set_title(f'Sample {result["sample_id"]} - GD Performance')
+        axes[i*3+1].set_xlabel('Generation')
+        axes[i*3+1].set_ylabel('Generational Distance')
+        axes[i*3+1].grid(True)
+        
+        # ΔP Performance
+        axes[i*3+2].plot(result['delta_p_history'])
+        axes[i*3+2].set_title(f'Sample {result["sample_id"]} - ΔP Performance')
+        axes[i*3+2].set_xlabel('Generation')
+        axes[i*3+2].set_ylabel('Delta P')
+        axes[i*3+2].grid(True)
+    
+    # Hide unused subplots
+    for i in range(len(all_results)*3, 9):
+        axes[i].set_visible(False)
+    
+    plt.tight_layout()
+    plt.savefig(f"{save_folder}/metrics_comparison.png")
+    plt.show()
+    
+    return all_results, df_summary
+
+# === GPU-accelerated batch processing (if available) ===
+def run_batch_gpu_generator(X_data, y_data, batch_size=5, max_rows=10, save_folder='Enhanced_Results_GPU'):
+    """Run batch processing with GPU acceleration"""
+    os.makedirs(save_folder, exist_ok=True)
+    
+    # Check for GPU availability
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    if device.type == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    
+    # Move model to device
+    model_gpu = final_model.to(device)
+    
+    all_results = []
+    start_time = time.time()
+    
+    # Process in batches
+    num_batches = int(np.ceil(min(max_rows, len(X_data)) / batch_size))
+    
+    for batch_idx in tqdm(range(num_batches), desc="Processing batches"):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, max_rows, len(X_data))
+        
+        batch_results = []
+        
+        for sample_idx in range(batch_start, batch_end):
+            sample_start_time = time.time()
+            
+            OriginalX = X_data[sample_idx]
+            TargetY = 1 - y_data[sample_idx]
+            
+            Problem = GermanCredit_CFEGenerator(OriginalX, TargetY, MAD, len(cont_indices), model_gpu)
+            Algorithm = FPS_Enhanced_GA()
+            
+            CA, CA_objs = Algorithm.Solve(Problem, N=50, generations=15)
+            
+            # Select final CFEs
+            def select_final_cfes(CA, k=10):
+                if len(CA) <= k:
+                    return CA
+                kmeans = KMeans(n_clusters=k, random_state=0).fit(CA)
+                final = []
+                for i in range(k):
+                    idxs = np.where(kmeans.labels_ == i)[0]
+                    if len(idxs) > 0:
+                        final.append(CA[np.random.choice(idxs)])
+                return np.array(final)
+            
+            CFEs = select_final_cfes(CA, k=10)
+            
+            runtime = time.time() - sample_start_time
+            
+            # Evaluate CFEs on GPU
+            CFEs_tensor = torch.tensor(CFEs, dtype=torch.float32).to(device)
+            with torch.no_grad():
+                preds = model_gpu(CFEs_tensor).cpu().numpy().flatten()
+            
+            # Feasibility
+            if TargetY == 1:
+                feasibility = np.mean(preds > 0.5)
+            else:
+                feasibility = np.mean(preds < 0.5)
+            
+            result = {
+                'sample_id': sample_idx + 1,
+                'feasibility': feasibility,
+                'runtime': runtime,
+                'CFEs': CFEs,
+                'CA': CA,
+                'CA_objs': CA_objs,
+                'hv_history': Algorithm.hv_history,
+                'gd_history': Algorithm.gd_history,
+                'delta_p_history': Algorithm.delta_p_history
+            }
+            
+            batch_results.append(result)
+            
+            # Save individual result
+            np.savez(f"{save_folder}/result_{sample_idx+1:03d}.npz",
+                    CFEs=result['CFEs'], 
+                    CA=result['CA'], 
+                    CA_objs=result['CA_objs'],
+                    hv_history=result['hv_history'],
+                    gd_history=result['gd_history'],
+                    delta_p_history=result['delta_p_history'],
+                    runtime=result['runtime'])
+        
+        all_results.extend(batch_results)
+        
+        # Clear GPU cache between batches
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+    
+    total_runtime = time.time() - start_time
+    
+    # Create summary
+    results_summary = []
+    for result in all_results:
+        summary = {
+            'sample_id': result['sample_id'],
+            'feasibility': result['feasibility'],
+            'runtime': result['runtime']
+        }
+        results_summary.append(summary)
+    
+    df_summary = pd.DataFrame(results_summary)
+    df_summary.to_csv(f"{save_folder}/summary_results.csv", index=False)
+    
+    print(f"\nGPU Batch Processing Completed")
+    print(f"Total samples: {len(all_results)}")
+    print(f"Total runtime: {total_runtime:.2f}s")
+    print(f"Average runtime per sample: {df_summary['runtime'].mean():.2f}s")
+    
+    return all_results, df_summary
+
+# === Main execution ===
+if __name__ == "__main__":
+    # Run parallel processing
+    print("="*60)
+    print("FPS-Enhanced GA with Parallel Computing")
+    print("="*60)
+    
+    # Option 1: Run parallel processing (recommended for CPU)
+    parallel_results, parallel_summary = run_parallel_generator(
+        X_processed, y, max_rows=20, save_folder='Enhanced_Results_Parallel', n_workers=4
+    )
+    
+    # Option 2: Run GPU batch processing (if GPU is available)
+    if torch.cuda.is_available():
+        print("\n" + "="*60)
+        print("Running GPU-accelerated batch processing")
+        print("="*60)
+        
+        gpu_results, gpu_summary = run_batch_gpu_generator(
+            X_processed, y, batch_size=5, max_rows=20, save_folder='Enhanced_Results_GPU'
+        )
+    
+    # Load and display example results
+    print("\n" + "="*60)
+    print("Example Results from First Sample")
+    print("="*60)
+    
+    data = np.load('Enhanced_Results_Parallel/result_001.npz')
+    print("Files in result:", data.files)
+    print("CFEs shape:", data['CFEs'].shape)
+    print("CA_objs shape:", data['CA_objs'].shape)
+    print("HV history length:", len(data['hv_history']))
+    print(f"Runtime: {data['runtime']:.2f}s")
+    
+    # Display first few CFEs
+    print(f"\nFirst 3 Counterfactual Explanations:")
+    for i in range(min(3, len(data['CFEs']))):
+        print(f"CFE {i+1}: {data['CFEs'][i][:5]}...")  # Show first 5 features
+        
+    # Compare original vs counterfactual
+    original_sample = X_processed[0]
+    print(f"\nOriginal sample (first 5 features): {original_sample[:5]}")
+    
+    # Calculate feature changes
+    if len(data['CFEs']) > 0:
+        changes = np.abs(data['CFEs'][0] - original_sample)
+        num_changed = np.sum(changes > 0.01)  # Threshold for meaningful change
+        print(f"Number of features changed: {num_changed}/{len(original_sample)}")
+        print(f"Average change magnitude: {np.mean(changes):.4f}")
+    
+    print("\n" + "="*60)
+    print("PARALLEL COUNTERFACTUAL GENERATION COMPLETE")
+    print("="*60)
